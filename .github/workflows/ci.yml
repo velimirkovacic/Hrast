@@ -1,0 +1,148 @@
+
+name: Discord Music Bot CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Python and Docker
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check Python syntax
+        run: python -m compileall -q src
+
+      - name: Build Docker image
+        run: docker build -t discord-music-bot:ci .
+
+  publish:
+    name: Publish image to GHCR
+    runs-on: ubuntu-24.04
+    needs: validate
+
+    if: >-
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Normalize image owner
+        id: owner
+        shell: bash
+        run: |
+          echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.value }}/discord-music-bot:latest
+            ghcr.io/${{ steps.owner.outputs.value }}/discord-music-bot:${{ github.sha }}
+
+  deploy:
+    name: Deploy music bot
+    runs-on: [self-hosted, linux, x64, cinesrijeda-prod]
+    needs: publish
+
+    if: >-
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main'
+
+    concurrency:
+      group: discord-music-bot-production
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy only the music bot
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE_OWNER="$(echo "$IMAGE_OWNER" | tr '[:upper:]' '[:lower:]')"
+          BOT_DIR="/opt/hrast"
+          COMPOSE_FILE="$GITHUB_WORKSPACE/docker-compose.yml"
+
+          test -f "$COMPOSE_FILE"
+          test -f "$BOT_DIR/.env"
+
+          override_file="$(mktemp)"
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -f "$override_file"' EXIT
+
+          cat > "$override_file" <<EOF
+          services:
+            hrast:
+              image: ghcr.io/${IMAGE_OWNER}/discord-music-bot:${IMAGE_TAG}
+          EOF
+
+          compose=(
+            docker compose
+            --project-directory "$BOT_DIR"
+            -f "$COMPOSE_FILE"
+            -f "$override_file"
+          )
+
+          # Validate the configuration before deployment.
+          "${compose[@]}" config -q
+
+          # Pull and recreate only the music bot service.
+          "${compose[@]}" pull hrast
+          "${compose[@]}" up -d --no-deps hrast
+
+          # Show the bot's current state.
+          docker ps --filter "name=^/hrast$"
+          "${compose[@]}" logs --tail=40 hrast

@@ -1,0 +1,8 @@
+
+services:
+  hrast:
+    image: ghcr.io/velimirkovacic/discord-music-bot:latest
+    container_name: hrast
+    restart: unless-stopped
+    env_file:
+      - /opt/hrast/.env
