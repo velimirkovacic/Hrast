@@ -78,7 +78,7 @@ jobs:
 
   deploy:
     name: Deploy music bot
-    runs-on: [self-hosted, linux, x64, cinesrijeda-prod]
+    runs-on: [self-hosted, linux, x64, hrast-prod]
     needs: publish
 
     if: >-
