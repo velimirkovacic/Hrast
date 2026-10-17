@@ -1,0 +1,45 @@
+
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+logs/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Downloaded or generated audio
+*.mp3
+*.wav
+*.m4a
+*.webm
+*.opus
+
+# Temporary files
+*.tmp
+*.temp

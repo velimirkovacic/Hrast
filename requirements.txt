@@ -1,0 +1,4 @@
+discord.py[voice]
+python-Levenshtein
+youtube-search-python
+yt-dlp
