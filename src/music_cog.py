@@ -609,8 +609,7 @@ class music_cog(commands.Cog):
         except Exception:
             log.error("sviraj command failed:\n%s", traceback.format_exc())
             await ctx.send(
-                "Došlo je do greške pri traženju pjesme. "
-                "Pogledaj Docker logove."
+                "Neću, to je slop..."
             )
 
     @commands.command(
