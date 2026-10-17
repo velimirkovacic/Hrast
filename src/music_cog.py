@@ -8,7 +8,9 @@ import random
 import logging
 import traceback
 from datetime import datetime
-
+import os
+import shutil
+import tempfile
 
 # Timestamped logging to Docker stdout
 logging.basicConfig(
@@ -26,7 +28,8 @@ class music_cog(commands.Cog):
 
         self.is_playing = False
         self.is_paused = False
-
+        self._current_temp_dir = None
+        self._playback_lock = asyncio.Lock()
         # Queue entries: [song, voice_channel]
         self.music_queue = []
 
@@ -230,6 +233,61 @@ class music_cog(commands.Cog):
     # ---------------------------------------------------------
     # YouTube search
     # ---------------------------------------------------------
+    def _download_song(self, url, temp_dir):
+        """Download a song and return its local file path and metadata."""
+        options = dict(self.YDL_OPTIONS)
+        options.update({
+            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+            "noplaylist": True,
+        })
+
+        log.info("Downloading song to temporary directory: %s", temp_dir)
+
+        with YoutubeDL(options) as ytdl:
+            data = ytdl.extract_info(url, download=True)
+
+            if not data:
+                raise RuntimeError("yt-dlp returned no song metadata")
+
+            downloads = data.get("requested_downloads") or []
+            filepath = downloads[0].get("filepath") if downloads else None
+
+            if not filepath:
+                filepath = ytdl.prepare_filename(data)
+
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(
+                f"Downloaded audio file was not found: {filepath}"
+            )
+
+        log.info(
+            "Download completed: title=%r file=%s size=%d bytes",
+            data.get("title"),
+            filepath,
+            os.path.getsize(filepath),
+        )
+
+        return filepath, data
+
+    def _cleanup_current_download(self):
+        """Delete the temporary directory for the finished song."""
+        temp_dir = self._current_temp_dir
+        self._current_temp_dir = None
+
+        if not temp_dir:
+            return
+
+        try:
+            shutil.rmtree(temp_dir)
+            log.info("Deleted temporary audio directory: %s", temp_dir)
+        except FileNotFoundError:
+            log.info("Temporary audio directory already deleted: %s", temp_dir)
+        except Exception:
+            log.exception(
+                "Failed to delete temporary audio directory: %s",
+                temp_dir,
+            )
+
 
     def search_yt(self, item):
         log.info("YouTube search started: query=%r", item)
@@ -271,6 +329,7 @@ class music_cog(commands.Cog):
     # Audio playback callbacks
     # ---------------------------------------------------------
 
+
     def _playback_finished(self, error):
         """Called by discord.py from the audio player's thread."""
         if error:
@@ -280,6 +339,10 @@ class music_cog(commands.Cog):
             )
         else:
             log.info("Audio playback finished normally")
+
+        # FFmpeg has finished reading this song. Linux allows the file to
+        # be unlinked even if the FFmpeg process is finishing its cleanup.
+        self._cleanup_current_download()
 
         try:
             future = asyncio.run_coroutine_threadsafe(
@@ -299,207 +362,175 @@ class music_cog(commands.Cog):
             log.exception("Could not schedule play_next() from playback callback")
 
     async def play_next(self):
+        await self._start_next_downloaded_song()
+
+    async def play_music(self, ctx):
+        await self._start_next_downloaded_song(ctx)
+
+    async def _start_next_downloaded_song(self, ctx=None):
+        """Serialize playback startup so only one task starts a song."""
+        async with self._playback_lock:
+            await self._start_next_downloaded_song_locked(ctx)
+
+
+    async def _start_next_downloaded_song_locked(self, ctx=None):
+        """Download and play queued songs, skipping songs that fail."""
         log.info(
-            "play_next called; queue length=%d; voice_client=%r",
+            "Starting downloaded-file playback; queue length=%d "
+            "voice_client=%r",
             len(self.music_queue),
             self.vc,
         )
 
         if self._disconnecting_automatically:
-            log.info("play_next skipped: automatic disconnect in progress")
-            return
-
-        if not self.music_queue:
-            self.is_playing = False
-            log.info("Queue empty; is_playing=False")
-            self._schedule_idle_disconnect()
+            log.info("Playback skipped: automatic disconnect in progress")
             return
 
         self._cancel_timer("_idle_task")
-        self.is_playing = True
 
-        try:
+        while self.music_queue:
             song_info, channel = self.music_queue[0]
             m_url = song_info["source"]
 
             log.info(
-                "Next queued song: title=%r url=%s channel=%s (%s)",
+                "Preparing queued song: title=%r url=%s channel=%s (%s)",
                 song_info.get("title"),
                 m_url,
                 getattr(channel, "name", "unknown"),
                 getattr(channel, "id", "unknown"),
             )
 
-            self.music_queue.pop(0)
+            # Ensure the bot is connected to the song's voice channel.
+            try:
+                if self.vc is None or not self.vc.is_connected():
+                    log.info(
+                        "Connecting to voice channel: %s",
+                        getattr(channel, "name", "unknown"),
+                    )
+                    self.vc = await channel.connect(
+                        timeout=20,
+                        reconnect=True,
+                    )
 
-            loop = asyncio.get_running_loop()
-            log.info("Extracting audio stream for next song")
+                elif self.vc.channel != channel:
+                    log.info(
+                        "Moving voice connection from %s to %s",
+                        getattr(self.vc.channel, "name", "unknown"),
+                        getattr(channel, "name", "unknown"),
+                    )
+                    await self.vc.move_to(channel)
 
-            data = await loop.run_in_executor(
-                None,
-                lambda: self.ytdl.extract_info(m_url, download=False),
-            )
-
-            if not data or not data.get("url"):
-                raise RuntimeError("yt-dlp returned no audio stream URL")
-
-            stream_url = data["url"]
-            log.info(
-                "Audio stream extracted; title=%r",
-                data.get("title"),
-            )
-
-            if self.vc is None or not self.vc.is_connected():
-                log.error("Cannot play next song: voice client is disconnected")
+            except Exception:
                 self.is_playing = False
+                log.exception(
+                    "Could not connect to the voice channel for %r",
+                    song_info.get("title"),
+                )
+
+                if ctx is not None:
+                    try:
+                        await ctx.send("Ne mogu se spojiti na glasovni kanal!")
+                    except Exception:
+                        log.exception("Could not report voice connection failure")
+
+                # Keep the song queued so a later command can retry.
                 self._schedule_idle_disconnect()
                 return
 
-            log.info(
-                "Starting FFmpeg playback; connected=%s playing=%s paused=%s",
-                self.vc.is_connected(),
-                self.vc.is_playing(),
-                self.vc.is_paused(),
-            )
-
-            source = discord.FFmpegPCMAudio(
-                stream_url,
-                executable="/usr/bin/ffmpeg",
-                before_options=(
-                    "-reconnect 1 -reconnect_streamed 1 "
-                    "-reconnect_delay_max 5"
-                ),
-                options="-vn",
-            )
-
-            self.vc.play(source, after=self._playback_finished)
-            log.info("Playback started successfully")
-
-        except Exception:
-            self.is_playing = False
-            log.error("play_next() failed:\n%s", traceback.format_exc())
-            self._schedule_idle_disconnect()
-
-    async def play_music(self, ctx):
-        if self._disconnecting_automatically:
-            log.info("play_music skipped: automatic disconnect in progress")
-            return
-        
-        log.info(
-            "play_music called; queue length=%d; is_playing=%s; is_paused=%s",
-            len(self.music_queue),
-            self.is_playing,
-            self.is_paused,
-        )
-
-        if not self.music_queue:
-            self.is_playing = False
-            log.info("play_music: queue is empty")
-            return
-
-        self._cancel_timer("_idle_task")
-
-        try:
-            song_info, channel = self.music_queue[0]
-            m_url = song_info["source"]
-
-            log.info(
-                "Preparing song: title=%r channel=%s channel_id=%s",
-                song_info.get("title"),
-                getattr(channel, "name", "unknown"),
-                getattr(channel, "id", "unknown"),
-            )
-
-            if self.vc is None or not self.vc.is_connected():
-                log.info("No active voice connection; attempting channel.connect()")
-                log.info(
-                    "Target voice channel: name=%s id=%s guild_id=%s",
-                    getattr(channel, "name", "unknown"),
-                    getattr(channel, "id", "unknown"),
-                    getattr(getattr(channel, "guild", None), "id", "unknown"),
-                )
-
-                self.vc = await channel.connect(timeout=20, reconnect=True)
-
-                log.info(
-                    "channel.connect() returned: voice_client=%r connected=%s",
-                    self.vc,
-                    self.vc.is_connected() if self.vc else False,
-                )
-
-                if self.vc is None:
-                    self.is_playing = False
-                    log.error("channel.connect() returned None")
-                    await ctx.send("Ne mogu se spojiti!")
-                    return
-            else:
-                log.info(
-                    "Moving voice connection from %s to %s",
-                    getattr(getattr(self.vc, "channel", None), "name", "unknown"),
-                    getattr(channel, "name", "unknown"),
-                )
-                await self.vc.move_to(channel)
-                log.info("move_to() completed")
-
+            # Remove this song before attempting the download. If the
+            # download fails, the loop continues to the next queued song.
             self.music_queue.pop(0)
-            log.info("Song removed from queue; remaining=%d", len(self.music_queue))
+            temp_dir = tempfile.mkdtemp(prefix="hrast-")
 
-            loop = asyncio.get_running_loop()
-            log.info("Extracting audio stream for %r", song_info.get("title"))
-
-            data = await loop.run_in_executor(
-                None,
-                lambda: self.ytdl.extract_info(m_url, download=False),
-            )
-
-            if not data or not data.get("url"):
-                raise RuntimeError("yt-dlp returned no audio stream URL")
-
-            log.info("Stream URL extracted; title=%r", data.get("title"))
-            if not discord.opus.is_loaded():
-                log.warning(
-                    "Opus is not loaded. PCM voice playback may fail. "
-                    "Check discord.opus.load_opus('libopus.so.0') at startup."
-                )
-
-            log.info("Creating FFmpeg audio source")
-
-            source = discord.FFmpegPCMAudio(
-                data["url"],
-                executable="/usr/bin/ffmpeg",
-                before_options=(
-                    "-reconnect 1 -reconnect_streamed 1 "
-                    "-reconnect_delay_max 5"
-                ),
-                options="-vn",
-            )
-
-            log.info("Calling voice_client.play()")
-
-            self.vc.play(source, after=self._playback_finished)
-            self.is_playing = True
-            log.info(
-                "Playback started; connected=%s playing=%s paused=%s",
-                self.vc.is_connected(),
-                self.vc.is_playing(),
-                self.vc.is_paused(),
-            )
-
-        except Exception as e:
-            self.is_playing = False
-            log.error(
-                "play_music failed: %s: %s\n%s",
-                type(e).__name__,
-                e,
-                traceback.format_exc(),
-            )
             try:
-                await ctx.send(
-                    f"Greška pri pokretanju glazbe: {type(e).__name__}: {e}"
+                loop = asyncio.get_running_loop()
+
+                log.info(
+                    "Downloading queued song: title=%r",
+                    song_info.get("title"),
                 )
+
+                filepath, data = await loop.run_in_executor(
+                    None,
+                    self._download_song,
+                    m_url,
+                    temp_dir,
+                )
+
+                if not self.vc or not self.vc.is_connected():
+                    raise RuntimeError(
+                        "Voice connection was lost during the download"
+                    )
+
+                if not discord.opus.is_loaded():
+                    log.warning(
+                        "Opus is not loaded. Check "
+                        "discord.opus.load_opus('libopus.so.0') at startup."
+                    )
+
+                log.info(
+                    "Creating FFmpeg source from downloaded file: %s",
+                    filepath,
+                )
+
+                source = discord.FFmpegPCMAudio(
+                    filepath,
+                    executable="/usr/bin/ffmpeg",
+                    options="-vn",
+                )
+
+                # Track the directory before starting playback so the
+                # callback can clean it up when playback finishes.
+                self._current_temp_dir = temp_dir
+
+                log.info("Starting local-file playback: title=%r", data.get("title"))
+
+                self.vc.play(
+                    source,
+                    after=self._playback_finished,
+                )
+
+                self.is_playing = True
+                self.is_paused = False
+
+                log.info(
+                    "Local-file playback started; title=%r connected=%s "
+                    "playing=%s paused=%s",
+                    data.get("title"),
+                    self.vc.is_connected(),
+                    self.vc.is_playing(),
+                    self.vc.is_paused(),
+                )
+                return
+
             except Exception:
-                log.exception("Could not send playback error to Discord")
-            self._schedule_idle_disconnect()
+                log.exception(
+                    "Download or playback setup failed for title=%r; "
+                    "skipping to the next queued song",
+                    song_info.get("title"),
+                )
+
+                if self._current_temp_dir == temp_dir:
+                    self._current_temp_dir = None
+
+                try:
+                    shutil.rmtree(temp_dir)
+                    log.info("Deleted failed song's temporary files: %s", temp_dir)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    log.exception(
+                        "Failed to delete temporary files for %r",
+                        song_info.get("title"),
+                    )
+
+                # Continue the loop to try the next song in the queue.
+
+        self.is_playing = False
+        self.is_paused = False
+
+        log.info("Queue empty; is_playing=False")
+        self._schedule_idle_disconnect()
 
     # ---------------------------------------------------------
     # Commands
@@ -742,6 +773,7 @@ class music_cog(commands.Cog):
             log.info("Disconnecting from voice channel")
             vc = self.vc
             await vc.disconnect()
+            self._cleanup_current_download()
 
             if self.vc is vc:
                 self.vc = None
